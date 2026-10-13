@@ -6,6 +6,9 @@
 #include <MangaPanel.h>
 #include <Memory.h>
 
+#include <algorithm>
+#include <cstdio>
+
 #include "BookStats.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -16,6 +19,7 @@
 #include "SdCardFontSystem.h"
 #include "XtcReaderActivity.h"
 #include "activities/util/BmpViewerActivity.h"
+#include "util/PluginEvents.h"
 
 ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
                                std::string bookPath, const bool allowFastInitialRefresh)
@@ -32,7 +36,7 @@ std::unique_ptr<Activity> ReaderActivity::create(GfxRenderer& renderer, MappedIn
     return makeUniqueNoThrow<MangaReaderActivity>(renderer, mappedInput, std::move(path));
   }
 
-  if (FsHelpers::hasBmpExtension(path) || FsHelpers::hasPngExtension(path)) {
+  if (FsHelpers::hasImageExtension(path)) {
     return makeUniqueNoThrow<BmpViewerActivity>(renderer, mappedInput, std::move(path));
   }
 
@@ -42,6 +46,30 @@ std::unique_ptr<Activity> ReaderActivity::create(GfxRenderer& renderer, MappedIn
 
   // EPUB, and TXT/Markdown too: those are converted to HTML and read through the EPUB pipeline.
   return makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+}
+
+void ReaderActivity::notePageTurn(const bool forward, const bool succeeded) {
+  sessionReporter.noteTurn(forward, succeeded);
+  paceForwardPending.store(forward && succeeded, std::memory_order_release);
+}
+
+// The one place every reader here reports a page reaching the panel -- horizontal and vertical
+// EPUB pages, XTC pages, the end-of-book screen -- so the reading session is fed from this point
+// rather than from each render path.
+void ReaderActivity::markPageRendered() {
+  pageRendered.store(true, std::memory_order_release);
+  const int progressBp = getProgressBasisPoints();
+  sessionReporter.pageRendered(progressBp);
+  // A forward page counts toward the reading speed when it was on screen between 2 s and 30 min,
+  // the reading session's own bounds: shorter is skimming, longer is the reader away.
+  const uint32_t now = millis();
+  if (paceForwardPending.exchange(false, std::memory_order_acq_rel) && paceHasAnchor) {
+    const uint32_t seconds = (now - paceAnchorMs) / 1000;
+    if (seconds >= 2 && seconds <= 1800) readingPace.addPage(seconds, progressBp - paceAnchorBp);
+  }
+  paceAnchorMs = now;
+  paceAnchorBp = progressBp;
+  paceHasAnchor = true;
 }
 
 void ReaderActivity::onEnter() {
@@ -65,7 +93,7 @@ void ReaderActivity::onEnter() {
 
   sdFontSystem.ensureLoaded(renderer);
   if (!loadBook()) {
-    finish();
+    if (!handleLoadFailure()) finish();
     return;
   }
 
@@ -83,12 +111,26 @@ void ReaderActivity::rememberBookOnceRendered() {
   APP_STATE.openEpubPath = bookPath;
   APP_STATE.saveToFile();
   RECENT_BOOKS.addBook(bookPath, getBookTitle(), getBookAuthor(), getBookThumbBmpPath());
+  const pluginevents::Var openVars[] = {{"book", bookPath.c_str()}};
+  pluginevents::emit(pluginevents::Event::ReaderOpen, openVars, 1);
 }
 
 void ReaderActivity::onExit() {
   Activity::onExit();
   ReaderUtils::flushReadingStats(readingSessionStartMs, true, hasBook() ? bookPath.c_str() : nullptr,
                                  hasBook() ? getBookLanguage() : nullptr);
+  // The book's CJK companion policy ends with the book: Home asks again, at the UI size, if a
+  // title on screen needs one. Cleared before onReaderExit(), whose font restore would otherwise
+  // reload the companion at the reader size only for it to be dropped here.
+  {
+    RenderLock lock;
+    sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
+  }
+  // Before onReaderExit(): it releases the book (and may move a finished one), after which
+  // neither the session's document id nor the exit percentage can be computed.
+  flushReaderSession();
+  const int exitPercent = hasBook() ? getScreenshotInfo().progressPercent : 0;
+  const bool hadBook = hasBook();
   onReaderExit();
 
   // Keep rebuildable font buffers from pinning the heap between reading sessions.
@@ -98,6 +140,15 @@ void ReaderActivity::onExit() {
 
   LOG_INF("MEM", "reader exit: free=%u max_block=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
+  // The session was flushed above, so its final progress is durable before a subscriber can act
+  // on the exit notification. A book that never opened has no exit to report.
+  if (hadBook && pluginevents::anySubscriber(pluginevents::Event::ReaderExit)) {
+    char percent[8];
+    snprintf(percent, sizeof(percent), "%d", exitPercent);
+    const pluginevents::Var vars[] = {{"book", bookPath.c_str()}, {"percent", percent}};
+    pluginevents::emit(pluginevents::Event::ReaderExit, vars, 2);
+  }
+
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
@@ -105,7 +156,16 @@ void ReaderActivity::onExit() {
   endOfBookOptionsReady.store(false, std::memory_order_release);
 }
 
+void ReaderActivity::prepareForSleep() { flushReaderSession(); }
+
+void ReaderActivity::flushReaderSession() {
+  sessionReporter.flush(bookPath, bookPath);
+  const std::string pacePath = paceFilePath();
+  if (!pacePath.empty()) readingPace.save(pacePath);
+}
+
 void ReaderActivity::loop() {
+  if (handleLoadFailureInput()) return;
   if (!hasBook()) {
     finish();
     return;
@@ -185,6 +245,8 @@ bool ReaderActivity::renderEndOfBook(const char* logTag) {
     endOfBookOptions->render(renderer, mappedInput);
   }
   renderer.displayBuffer();
+  // Credits the last page's dwell and brings the session's progress to the end of the book.
+  markPageRendered();
   return true;
 }
 

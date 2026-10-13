@@ -45,6 +45,10 @@ jobs:
             asset: x4pro-firmware.bin
           - pio_env: papermono-gh_release
             asset: papermono-firmware.bin
+          - pio_env: metalio_eink4-gh_release
+            asset: metalio_eink4-firmware.bin
+          - pio_env: eego_a4-gh_release
+            asset: eego_a4-firmware.bin
     steps:
       - uses: actions/checkout@v6
         with:
@@ -113,7 +117,15 @@ jobs:
           "$penv_python" -c "import platformio; print('penv Core', platformio.VERSION)"
 
       - name: Build CrossPoint
-        run: CROSSPOINT_RC_LABEL=rc CROSSPOINT_RC_HASH="$(git rev-parse --short=7 HEAD)" pio run -e "$PIO_ENV" -j1
+        run: |
+          # The _rc envs build "<version><label>+<hash>". A prerelease tag already names its stage
+          # (1.7.0-nightly-1, 1.6.5-rc-3), so it gets no label; anything else is marked -rc.
+          version="$(sed -n 's/^version = //p' platformio.ini | head -n1)"
+          case "$version" in
+            *-nightly-*|*-rc-*) label="" ;;
+            *) label="-rc" ;;
+          esac
+          CROSSPOINT_RC_LABEL="$label" CROSSPOINT_RC_HASH="$(git rev-parse --short=7 HEAD)" pio run -e "$PIO_ENV" -j1
 
       - name: Name release asset
         run: |
@@ -154,7 +166,8 @@ jobs:
           # Exactly the names OtaUpdater asks for; a missing one means some device would
           # see no update, so fail loudly rather than publish a half-updatable release.
           for asset in x4old-x3-firmware.bin x4c-firmware.bin sticky-firmware.bin \
-                       x4pro-firmware.bin papermono-firmware.bin; do
+                       x4pro-firmware.bin papermono-firmware.bin metalio_eink4-firmware.bin \
+                       eego_a4-firmware.bin; do
             path="$(find dist -type f -name "$asset" | head -1)"
             if [ -z "$path" ]; then
               echo "No $asset among the built artifacts" >&2

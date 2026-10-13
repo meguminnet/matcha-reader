@@ -13,7 +13,11 @@
 struct ReaderRenderSpec {
   int fontId = 0;
   float lineCompression = 1.0f;
+  // The Line Spacing setting itself (0 tight .. 2 wide). Vertical text sets its column gap in
+  // quarter ems from this step; lineCompression above is the same setting as horizontal reads it.
+  uint8_t lineSpacingLevel = 1;
   bool extraParagraphSpacing = false;
+  uint8_t paragraphIndentSpaces = 2;
   int8_t characterSpacing = 0;
   uint8_t wordSpacingPercent = 100;
   uint8_t paragraphAlignment = 0;
@@ -36,4 +40,33 @@ struct ReaderRenderSpec {
   // taking it from the store. Layout and drawing must agree on it: TextBlock::render shifts
   // words down by exactly the reserve this adds.
   bool furiganaEnabled = true;
+  // Matcha, vertical text: the margin right of the text area, bezel inset included. The first
+  // column's ruby is drawn there, and where it is narrower than the ruby the layout holds back
+  // the difference. Set by the reader like fontId; 0 (the default) reserves the full ruby width.
+  uint16_t rightMarginPx = 0;
+
+  bool operator==(const ReaderRenderSpec&) const = default;
 };
+
+// Stable signature for clipping anchors. Page-local word ordinals are valid
+// only for the exact layout that produced them.
+inline uint32_t readerRenderSpecSignature(const ReaderRenderSpec& spec) {
+  uint32_t signature = 2166136261U;
+  const auto mix = [&signature](const uint32_t value) {
+    signature ^= value;
+    signature *= 16777619U;
+  };
+  mix(static_cast<uint32_t>(spec.fontId));
+  mix(static_cast<uint32_t>(spec.lineCompression * 1000.0f));
+  mix(spec.extraParagraphSpacing);
+  mix(static_cast<uint8_t>(spec.characterSpacing));
+  mix(spec.wordSpacingPercent);
+  mix(spec.paragraphAlignment);
+  mix(spec.viewportWidth);
+  mix(spec.viewportHeight);
+  mix(spec.hyphenationEnabled);
+  mix(spec.embeddedStyle);
+  mix(spec.imageRendering);
+  mix(spec.focusReadingEnabled);
+  return signature == 0 ? 1 : signature;
+}

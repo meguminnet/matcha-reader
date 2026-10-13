@@ -306,6 +306,18 @@ void LibraryListActivity::showRecentBookOptions(const int entry) {
   requestUpdate();
 }
 
+#if FREEINK_CAP_TOUCH
+void LibraryListActivity::swipeDelete(const int entry) {
+  activeNav().selected = entry + 1;
+  if (isRecentSort(sortOrder) && entry < pinnedCount()) {
+    const auto& book = RECENT_BOOKS.getBooks()[static_cast<size_t>(entry)];
+    promptDeleteBookByPath(book.path, book.title);
+  } else {
+    promptDeleteBook(entry);
+  }
+}
+#endif
+
 // Manual index refresh, same card discipline as the onEnter rebuild: the walk
 // wants the card to itself, and the render task must not read the index (or
 // the filter) around it.
@@ -399,8 +411,7 @@ void LibraryListActivity::promptDeleteBookByPath(const std::string& path, const 
       RenderLock lock(*this);
       if (!result.isCancelled) {
         LOG_DBG("LIB", "deleting %s", path.c_str());
-        clearBookCache(path);
-        if (!Storage.remove(path.c_str())) LOG_ERR("LIB", "cannot delete %s", path.c_str());
+        if (!removeBookFile(path)) LOG_ERR("LIB", "cannot delete %s", path.c_str());
         if (RECENT_BOOKS.removeByPath(path)) RECENT_BOOKS.saveToFile();
         GUI.drawPopup(renderer, tr(STR_LIBRARY_REBUILDING));
         rebuildIndex();
@@ -458,6 +469,9 @@ void LibraryListActivity::onTabAction(const int index) {
 }
 
 void LibraryListActivity::selectTab(const int index, const bool toggleIfActive) {
+#if FREEINK_CAP_TOUCH
+  closeSwipeDelete();
+#endif
   if (index < 0 || index >= TAB_SLOTS) return;
   if (toggleIfActive && index == activeTab()) descendingTabs ^= static_cast<uint8_t>(1u << index);
   sortOrder = orderForTab(index, descendingTabs);
@@ -768,7 +782,6 @@ bool LibraryListActivity::handleButtons() {
 
 void LibraryListActivity::navigateButtons() {
   const int count = listCount();
-  auto& nav = activeNav();
   if (mappedInput.wasPressed(MappedInputManager::Button::NavNext) ||
       mappedInput.wasPressed(MappedInputManager::Button::NavPrevious)) {
     navigationStartedOnTabs = tabsFocused();
@@ -797,22 +810,22 @@ void LibraryListActivity::navigateButtons() {
   // A held button steps tabs while the strip has focus (the base behaviour
   // Settings keeps) and page-jumps once the selection is down in the rows,
   // where fast travel through a long shelf is what a hold means.
-  buttonNavigator.onNextContinuous([this, count, &nav] {
+  buttonNavigator.onNextContinuous([this, count] {
     if (navigationStartedOnTabs) {
       // Back onto the tabs first: the press may have carried the cursor into the rows or, on an
       // empty list, into the bottom bar.
       ringSetFocus(TabRing::Focus::TopTabs, false);
       stepTab(1);
     } else if (count > 0 && ringFocus() == TabRing::Focus::Content) {
-      moveRingTo(ButtonNavigator::nextPageIndex(selectedEntry(), count, nav.pageRows()) + 1);
+      moveRingTo(ButtonNavigator::nextPageIndex(selectedEntry(), count, activeNav().pageRows()) + 1);
     }
   });
-  buttonNavigator.onPreviousContinuous([this, count, &nav] {
+  buttonNavigator.onPreviousContinuous([this, count] {
     if (navigationStartedOnTabs) {
       ringSetFocus(TabRing::Focus::TopTabs, false);
       stepTab(-1);
     } else if (count > 0 && ringFocus() == TabRing::Focus::Content) {
-      moveRingTo(ButtonNavigator::previousPageIndex(selectedEntry(), count, nav.pageRows()) + 1);
+      moveRingTo(ButtonNavigator::previousPageIndex(selectedEntry(), count, activeNav().pageRows()) + 1);
     }
   });
 }
@@ -895,6 +908,9 @@ void LibraryListActivity::buildRows(UiScreen& screen) {
   props.items = winItems.data();
   props.itemsWindowFirst = static_cast<uint16_t>(windowStart);
   props.itemsWindowCount = static_cast<uint16_t>(winItems.size());
+#if FREEINK_CAP_TOUCH
+  configureSwipeDelete(screen, props);
+#endif
   screen.list(props);
   const int next = nav.drawnRows;
   const auto body = screen.body();

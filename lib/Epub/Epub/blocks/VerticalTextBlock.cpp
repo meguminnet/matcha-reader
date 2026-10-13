@@ -29,6 +29,36 @@ void drawInlineImage(GfxRenderer& renderer, const VerticalPage& page, const Vert
   block.render(renderer, x, y);
 }
 
+// The sesame mark (U+FE45): a teardrop from a thin tail at the top left to a round head at the
+// bottom right, like the 丶 stroke. Built once per page; each pixel is inside when it lies within
+// the radius that tapers linearly along the tail-to-head axis.
+struct SesameMask {
+  int size = 0;
+  uint16_t rows[16] = {};
+};
+
+SesameMask makeSesameMask(const int cellPx) {
+  SesameMask m;
+  m.size = std::clamp(cellPx * 4 / 10, 6, 16);
+  const float n = static_cast<float>(m.size);
+  const float headR = n * 0.30f;
+  const float tailR = n * 0.06f;
+  const float x0 = n * 0.18f, y0 = n * 0.12f;                // tail centre
+  const float x1 = n - headR - 0.5f, y1 = n - headR - 0.5f;  // head centre
+  const float ax = x1 - x0, ay = y1 - y0;
+  const float len2 = ax * ax + ay * ay;
+  for (int row = 0; row < m.size; ++row) {
+    for (int col = 0; col < m.size; ++col) {
+      const float px = col + 0.5f - x0, py = row + 0.5f - y0;
+      const float t = std::clamp((px * ax + py * ay) / len2, 0.0f, 1.0f);
+      const float ex = px - t * ax, ey = py - t * ay;
+      const float r = tailR + (headR - tailR) * t;
+      if (ex * ex + ey * ey <= r * r) m.rows[row] |= static_cast<uint16_t>(1u << col);
+    }
+  }
+  return m;
+}
+
 // Returns the cell size it drew with, so a caller needing the same geometry (ruby) reuses it
 // instead of re-deriving it -- every derivation probes the reference glyph out of the SD font.
 int drawGlyphs(GfxRenderer& renderer, const VerticalPage& page, int fontId, int offsetX, int offsetY, bool black) {
@@ -43,6 +73,7 @@ int drawGlyphs(GfxRenderer& renderer, const VerticalPage& page, int fontId, int 
   const int ascender = renderer.getFontAscenderSize(fontId);
   const int baselineInCell = verticalCellBaselineOffset(renderer, fontId, cellPx);
   const int uprightTopAdjust = baselineInCell - ascender;
+  const SesameMask sesame = makeSesameMask(cellPx);
 
   // Styled-block borders (kakomi boxes, .k-solid-top separator rules). Rects share the glyphs'
   // cell-top coordinate space and the same offsets. `edges` says which lines to draw; EXTEND_*
@@ -124,10 +155,15 @@ int drawGlyphs(GfxRenderer& renderer, const VerticalPage& page, int fontId, int 
 
     if (g.emphasis) {
       // Sesame dot beside the character, clear of its cell by the same ink gap a normal pair of
-      // characters leaves.
-      const int emX = dx + cellPx + inkGapPx;
-      const int emY = dy;
-      renderer.drawText(fontId, emX, emY, "\xef\xb9\x85", black, static_cast<EpdFontFamily::Style>(EpdFontFamily::SUP));
+      // characters leaves. Stamped from a mask, not drawn as U+FE45: the built-in fonts lack that
+      // block, so a glyph showed as the missing-character box without a Japanese SD font.
+      const int left = dx + cellPx + inkGapPx + cellPx / 4 - sesame.size / 2;
+      const int top = cellTop + (cellPx - sesame.size) / 2;
+      for (int row = 0; row < sesame.size; ++row) {
+        for (int col = 0; col < sesame.size; ++col) {
+          if (sesame.rows[row] & (1u << col)) renderer.drawPixel(left + col, top + row, black);
+        }
+      }
     }
   }
   return cellPx;
@@ -143,7 +179,15 @@ void VerticalTextBlock::render(GfxRenderer& renderer, int fontId, int rubyFontId
                                bool black) const {
   const int cellPxLocal = drawGlyphs(renderer, page_, fontId, offsetX, offsetY, black);
 
-  const int rubyLineH = (renderer.getLineHeight(rubyFontId) + 1) / 2;
+  // JLREQ 3.3.2: ruby is half the size of its base and set solid, so one ruby character's body is
+  // half an EM. The font's line height is the wrong yardstick: it carries Latin leading (48px
+  // against a 33px em in Noto Serif JP), which stepped the ruby 45% too far apart and ran every
+  // annotation past the foot of its base.
+  const int rubyEmPx = verticalCellPx(renderer, rubyFontId);
+  const int rubyLineH = (rubyEmPx + 1) / 2;
+  // Baseline of a ruby character below the top of its body: the base text's measured figure,
+  // halved with the glyph.
+  const int rubyBaselineInBody = verticalCellBaselineOffset(renderer, rubyFontId, rubyEmPx) / 2;
   const auto rubyStyle = static_cast<EpdFontFamily::Style>(EpdFontFamily::SUP);
 
   int prevRubyBottom = -9999;
@@ -202,11 +246,12 @@ void VerticalTextBlock::render(GfxRenderer& renderer, int fontId, int rubyFontId
 
     // JLREQ 3.3.5 nakatsuki (中付き): the ruby text's vertical centre aligns with the base
     // character's. Ruby is set solid, so its virtual length is N ruby bodies, and the alignment is
-    // on VIRTUAL BODIES rather than ink. The half-ascender term undoes a renderer detail: SUP
-    // scales the glyph to 50% but drawText still offsets by the full ascender.
+    // on VIRTUAL BODIES rather than ink. drawText() takes a top and puts the baseline
+    // textBaselineOffset() below it, so the top that lands the baseline where the body wants it
+    // is the body top plus the difference.
     const int rubyBlockH = static_cast<int>(rubyCharCount) * rubyLineH;
     const int rubyBodyTop = g.y + offsetY + (cellPxLocal - rubyBlockH) / 2;
-    int rubyY = rubyBodyTop - renderer.getFontAscenderSize(rubyFontId) / 2;
+    int rubyY = rubyBodyTop + rubyBaselineInBody - renderer.textBaselineOffset(rubyFontId, rubyText.c_str(), rubyStyle);
 
     // JLREQ 3.3.8: nakatsuki spills half the overhang each way; where a neighbour cannot be hung
     // over, its share moves to the other side.

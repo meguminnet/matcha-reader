@@ -329,6 +329,9 @@ class VerticalParsedText {
   // Horizontal distance between two column origins, for sizing an inline image in columns.
   int columnAdvancePx() const;
   void setColumnGapPx(int gapPx) { columnGapPx_ = gapPx; }
+  // The reader's Character Spacing setting, in px: added to the one-em step between characters
+  // down a column (字間). 0 is solid setting (ベタ組み).
+  void setCharacterSpacingPx(int spacingPx) { characterSpacingPx_ = spacingPx; }
   // Extra right-side padding (in pixels) reserved for vertical ruby so it
   // doesn't clip against the right edge.
   void setRightPaddingPx(int padPx) { rightPaddingPx_ = (padPx < 0) ? 0 : padPx; }
@@ -339,6 +342,7 @@ class VerticalParsedText {
   uint16_t viewportWidth_;
   uint16_t viewportHeight_;
   int columnGapPx_ = 0;
+  int characterSpacingPx_ = 0;
   int rightPaddingPx_ = 0;
 
   struct PendingChar {
@@ -408,6 +412,7 @@ class VerticalParsedText {
   // Geometry snapshot from the last layoutPages() call so finalizePendingPage() (called outside
   // layoutPages) can still close an open box rect on the final page.
   int boxGeomCellPx_ = 0;
+  int boxGeomRowPitchPx_ = 0;
   int boxGeomColumnAdvancePx_ = 0;
   int boxGeomUsableWidthPx_ = 0;
   // Rows a column INSIDE a box may use: short of a full column by boxFootReservePx_, so the
@@ -436,6 +441,10 @@ class VerticalParsedText {
   bool pendingTrailingBreak_ = false;
   uint16_t pendingColumn_ = 0;
   uint16_t pendingRow_ = 0;
+  // The current column's slide (see layoutPages()): carried like the row, or a batch boundary
+  // inside a slid column drops it and the next glyph lands on the one before (#415).
+  int pendingColumnYShift_ = 0;
+  uint16_t pendingShiftColumn_ = UINT16_MAX;
   bool pendingPageValid_ = false;  // false until the first layoutPages() call initializes pendingPage_
   // True once any page (streamed via callback or returned) has been produced across the whole
   // chapter, i.e. across every layoutPages() call since construction. Used only at the final flush

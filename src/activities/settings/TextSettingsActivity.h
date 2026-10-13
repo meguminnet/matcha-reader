@@ -6,10 +6,12 @@
 #include <string>
 #include <vector>
 
+#include "CrossPointSettings.h"
 #include "TextSettingsPreview.h"
 #include "activities/UiTabListActivity.h"
 #include "components/OptionPopup.h"
 #include "components/themes/BaseTheme.h"
+#include "util/CjkScript.h"
 
 // Reader text settings with a shared live preview pane: tab bar
 // (Font | Size | Layout | Style) is position 0 of the Up/Down nav ring, same
@@ -30,9 +32,11 @@ class TextSettingsActivity final : public UiTabListActivity {
   };
 
   TextSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const SdCardFontRegistry* registry,
-                       Tab initialTab = Tab::Family, bool japaneseBook = false, bool verticalText = false);
+                       Tab initialTab = Tab::Family, CjkScript bookScript = CjkScript::None, bool verticalText = false,
+                       bool profileChoice = false);
 
   void onEnter() override;
+  void onExit() override;
   void render(RenderLock&&) override;
 
  private:
@@ -44,6 +48,7 @@ class TextSettingsActivity final : public UiTabListActivity {
     WordSpacing,
     CharacterSpacing,
     ParaSpacing,
+    ParaIndentation,
     Alignment,
     ScreenMargin,
     BookSideMargins,
@@ -85,13 +90,13 @@ class TextSettingsActivity final : public UiTabListActivity {
   // True when the focused list row is a setting the preview cannot reflect.
   bool focusedRowHasNoPreview() const;
   void switchTab(int direction = 1);
-  // Maps a visible list position to its LayoutRow: a Japanese book hides ParaSpacing,
+  // Maps a visible list position to its LayoutRow: a CJK book hides ParaSpacing,
   // Alignment and BookSideMargins, so position and enum value diverge.
   LayoutRow layoutRowAt(int visibleIndex) const;
   // Fills `out` (when non-null, room for LayoutRow::Count) with the Layout rows shown for this
   // book, in order, and returns how many.
   int visibleLayoutRows(LayoutRow* out) const;
-  // Japanese books hide FocusReading/Hyphenation; vertical Japanese also hides AntiAliasing.
+  // CJK books hide FocusReading/Hyphenation; vertical text also hides AntiAliasing.
   StyleRow styleRowAt(int visibleIndex) const;
   // Sentinel settingIndex for the "Manage Fonts" row appended to the family list. It opens
   // FontDownloadActivity instead of selecting a font -- the shortcut the pre-1.5.0 font
@@ -102,8 +107,20 @@ class TextSettingsActivity final : public UiTabListActivity {
   }
   // Rebuilds fonts_ (families installed on the card can change while this screen is open).
   void rebuildFamilyList();
-  const bool japaneseBook_ = false;
+  // Script of the book these settings apply to (None outside a CJK book). CJK books share the
+  // Japanese row set; the script also picks the preview face.
+  const CjkScript bookScript_ = CjkScript::None;
+  const bool cjkBook_ = false;
   const bool verticalText_ = false;
+
+  // Text profiles (Settings, not a book): an "Edit for" row heads the Size and Layout tabs and
+  // switches which profile -- Latin or CJK -- the four profile rows edit. While CJK is chosen its
+  // values sit in the live fields (as when reading a CJK book) and the Latin ones wait here.
+  const bool profileChoice_;
+  bool editingCjk_ = false;
+  CrossPointSettings::TextProfile latinWhileEditingCjk_{};
+  int profileRows() const { return profileChoice_ && (tab_ == Tab::Size || tab_ == Tab::Layout) ? 1 : 0; }
+  void toggleProfile();
 
   // Row storage for the active tab: rowItems_ (label/actionValue) is
   // rebuilt only when the tab or its backing data changes (rebuildRowItems(),

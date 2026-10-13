@@ -157,6 +157,7 @@ enum UIIcon {
   Settings,
   Transfer,
   Library,
+  Plugins,
   Wifi,
   Hotspot,
   Bookmark,
@@ -171,7 +172,7 @@ enum UIIcon {
 namespace BaseMetrics {
 constexpr ThemeMetrics values = {.batteryWidth = 15,
                                  .batteryHeight = 12,
-                                 .topPadding = 5,
+                                 .topPadding = 10,
                                  .batteryBarHeight = 20,
                                  .headerHeight = 84,
                                  .verticalSpacing = 10,
@@ -264,7 +265,7 @@ class BaseTheme {
   // Shared by every theme's drawButtonHints(): centres a hint label in its box,
   // wrapping to two lines rather than overflowing when it's too wide to fit.
   static void drawHintLabel(const GfxRenderer& renderer, int fontId, const char* label, int x, int boxWidth, int boxTop,
-                            int boxHeight, int singleLineYOffset);
+                            int boxHeight);
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
   // Menu row height as DRAWN by drawButtonMenu. HomeActivity builds its touch
   // grid from this, so hit bands always match the visuals (RoundedRaff derives
@@ -279,7 +280,8 @@ class BaseTheme {
                         const std::function<std::string(int index)>& rowValue = nullptr, bool highlightValue = false,
                         const std::function<bool(int index)>& rowDimmed = nullptr, bool showScrollbar = true) const;
   // Also draws the wall clock opposite the battery when the user enabled
-  // SETTINGS.clockShowInHeader and an RTC is present. On touch boards a
+  // SETTINGS.clockShowInHeader and the device has a time (from its clock chip, or the system clock
+  // on boards without one). On touch boards a
   // tappable back button leads the band (see HeaderBackTapTarget); root
   // screens that own their stack bottom pass backButton = false.
   // underline: -1 leaves it to the theme (the Cover Grid theme draws no rule under any header),
@@ -314,12 +316,31 @@ class BaseTheme {
   virtual void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                               const std::function<std::string(int index)>& buttonLabel,
                               const std::function<UIIcon(int index)>& rowIcon) const;
+  // A selection handle: a white disc with a black outline and one square corner, the corner being
+  // the point that aims at the selected text.
+  enum class HandleCorner : uint8_t { TopLeft, TopRight, BottomLeft, BottomRight };
+  static void drawSelectionHandle(const GfxRenderer& renderer, Rect rect, HandleCorner corner);
+  static int selectionHandleSize();
+  // Selection action bar: a 24px outline icon over its label in each slot (see drawSelectionActions).
+  static constexpr int SELECTION_ACTION_COUNT = 4;
+  static constexpr int SELECTION_ACTION_ICON_PX = 40;
+  static constexpr int SELECTION_ACTION_GAP_PX = 4;
+  // Air above the icons and below the labels.
+  static constexpr int SELECTION_ACTION_VPAD_PX = 12;
+  // The pointer under the bar: this tall, twice this wide, aimed at anchorX.
+  static constexpr int SELECTION_ACTION_TAIL_PX = 8;
+  // Air around each slot and between slots, and the card's corner radius: tighter and rounder than
+  // the generic menu metrics, so the three actions read as one compact bubble.
+  static constexpr int SELECTION_ACTION_PAD_PX = 4;
+  static constexpr int SELECTION_ACTION_RADIUS_PX = 12;
+  // anchorX < 0 draws no pointer.
+  static void drawSelectionActions(const GfxRenderer& renderer, Rect rect, int anchorX = -1);
   virtual Rect drawPopup(const GfxRenderer& renderer, const char* message) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
   static void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage, const int pageCount,
                             std::string title, const int paddingBottom = 0, const int textYOffset = 0,
                             const bool fillMargin = true, const bool isPageBookmarked = false,
-                            const bool pageCountEstimated = false);
+                            const bool pageCountEstimated = false, int timeLeftSeconds = -1);
   static void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label);
   virtual void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
                              int contentStartX = 0, int contentWidth = 0) const;

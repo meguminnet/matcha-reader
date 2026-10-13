@@ -20,6 +20,11 @@ class HomeActivity final : public Activity {
   int selectorIndex = 0;
   // True once the cover scan has walked every recent book. Reset when the slot height changes.
   bool recentsLoaded = false;
+  // Back was pressed while this screen was up. With Back Resumes Last Book on, its release opens the
+  // last book -- and a release left over from the Back that brought the user here (Settings leaves
+  // on the press) must not.
+  bool backPressSeen = false;
+  bool backResumes() const;
   // Set after the cover grid's first paint: that pass uses a clean HALF refresh, later ones FAST.
   bool firstRenderDone = false;
   // Partial-redraw state: after a full render, a cursor move between two MENU rows only erases
@@ -29,6 +34,10 @@ class HomeActivity final : public Activity {
   bool lastRenderValid = false;
   int lastSelectorIndex = 0;
   bool hasOpdsServers = false;
+  bool hasPlugins = false;
+  // The home "library" slot (index 2) shows Plugins when any plugin is
+  // installed, otherwise OPDS. The index converters gate on its presence.
+  bool hasLibrarySlot() const { return hasPlugins || hasOpdsServers; }
   bool hasContinueReading = false;
   bool coverRendered = false;      // Track if cover has been rendered once
   bool coverBufferStored = false;  // Track if cover buffer is stored
@@ -105,6 +114,7 @@ class HomeActivity final : public Activity {
   void onFileTransferOpen();
   void onStatsOpen();
   void onOpdsBrowserOpen();
+  void onPluginsOpen();
 
   int getMenuItemCount() const;
   bool storeCoverBuffer();    // Store frame buffer for cover image

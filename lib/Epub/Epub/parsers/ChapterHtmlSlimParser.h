@@ -114,6 +114,7 @@ class ChapterHtmlSlimParser {
   int fontId;
   float lineCompression;
   bool extraParagraphSpacing;
+  uint8_t paragraphIndentSpaces = 2;
   int8_t characterSpacing = 0;
   uint8_t wordSpacingPercent = 100;
   uint8_t paragraphAlignment;
@@ -264,6 +265,7 @@ class ChapterHtmlSlimParser {
   // boundaries.
   XML_Parser xmlParser_ = nullptr;
   HalFile parseFile_;
+  bool firstParseChunk_ = true;  // the prolog is inspected once; see XhtmlDoctype.h
   uint32_t parseStartTime_ = 0;
 
   void updateEffectiveInlineStyle();
@@ -300,7 +302,7 @@ class ChapterHtmlSlimParser {
   void finishTableRow();
   void addTableRowSeparator();
   void setCurrentPageVisibleOffset(uint32_t offset);
-  void makePages();
+  void makePages(bool includeLastLine = true);
   static EpdFontFamily::Style fontStyleForTextDecoration(CssTextDecoration decoration);
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyTextDecorationToEntry(StyleStackEntry& entry, const CssStyle& css);
@@ -354,6 +356,7 @@ class ChapterHtmlSlimParser {
     characterSpacing = character;
     wordSpacingPercent = wordPercent;
   }
+  void setParagraphIndentSpaces(const uint8_t spaces) { paragraphIndentSpaces = spaces; }
 
   // One-shot parse: builds every page before returning (begin + step* + finish).
   bool parseAndBuildPages();

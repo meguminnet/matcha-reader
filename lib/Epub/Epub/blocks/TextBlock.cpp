@@ -14,8 +14,9 @@
 
 size_t TextBlock::arenaSize(const uint16_t wordCount, const bool hasFocus, const bool hasFonts,
                             const uint16_t textBytes) {
-  // Layout documented in TextBlock.h: 32-bit array first, then 16-bit, 8-bit, text.
-  size_t size = static_cast<size_t>(wordCount) * (sizeof(uint16_t) + sizeof(int16_t) + sizeof(uint8_t));
+  // Layout documented in TextBlock.h: source ranges, then the 32-bit array, then 16-bit, 8-bit, text.
+  size_t size =
+      static_cast<size_t>(wordCount) * (sizeof(SourceRange) + sizeof(uint16_t) + sizeof(int16_t) + sizeof(uint8_t));
   if (hasFocus) {
     size += static_cast<size_t>(wordCount) * (sizeof(uint16_t) + sizeof(uint8_t));
   }
@@ -28,9 +29,11 @@ size_t TextBlock::arenaSize(const uint16_t wordCount, const bool hasFocus, const
 void TextBlock::bindArenaPointers() {
   uint8_t* base = arena.get();
   const size_t wc = numWords;
+  sourceRanges = reinterpret_cast<const SourceRange*>(base);
+  base += wc * sizeof(SourceRange);
   size_t off = 0;
   if (fontsPresent) {
-    // First so the int32s sit 4-byte aligned (arena base is allocator-aligned) and the
+    // The int32s sit 4-byte aligned (source ranges keep the base aligned) and the
     // following 16-bit arrays stay even (wc * 4 is always even).
     wordFontArr = reinterpret_cast<const int32_t*>(base);
     off = wc * 4;
@@ -55,8 +58,12 @@ TextBlock::TextBlock(const std::vector<std::string>& words, const std::vector<in
                      const std::vector<EpdFontFamily::Style>& wordStyles, const std::vector<uint8_t>& focusBoundary,
                      const std::vector<uint16_t>& focusSuffixX, const BlockStyle& blockStyle,
                      std::vector<std::string> rubyTexts, const std::vector<int32_t>& wordFonts,
-                     std::vector<LinkSpan> linkSpans)
-    : blockStyle(blockStyle), rubyTexts(std::move(rubyTexts)), linkSpans(std::move(linkSpans)) {
+                     std::vector<LinkSpan> linkSpans, const std::vector<SourceRange>& ranges,
+                     const uint16_t paragraphStartWord)
+    : blockStyle(blockStyle),
+      paragraphStartWord(paragraphStartWord),
+      rubyTexts(std::move(rubyTexts)),
+      linkSpans(std::move(linkSpans)) {
   // Same invariant as deserialize(): a block never holds an all-empty rubyTexts, so a
   // ruby-less line costs nothing beyond its arena. The layout engine hands one over for
   // every line it extracts, ruby or not; release it here rather than carrying it for the
@@ -69,7 +76,9 @@ TextBlock::TextBlock(const std::vector<std::string>& words, const std::vector<in
   // block has one. When present, they must be sized in lockstep with words[].
   const bool hasFocus = !focusBoundary.empty();
   const bool hasFonts = !wordFonts.empty();
-  if (words.size() != wordXpos.size() || words.size() != wordStyles.size() || words.size() > 10000 ||
+  if ((!ranges.empty() && ranges.size() != words.size()) || words.size() != wordXpos.size() ||
+      words.size() != wordStyles.size() || words.size() > 10000 ||
+      (paragraphStartWord != UINT16_MAX && paragraphStartWord >= words.size()) ||
       (hasFocus && (words.size() != focusBoundary.size() || words.size() != focusSuffixX.size())) ||
       (hasFonts && words.size() != wordFonts.size())) {
     LOG_ERR("TXB",
@@ -127,6 +136,7 @@ TextBlock::TextBlock(const std::vector<std::string>& words, const std::vector<in
   auto* text = const_cast<char*>(textArr);
   uint16_t off = 0;
   for (uint16_t i = 0; i < numWords; i++) {
+    const_cast<SourceRange*>(sourceRanges)[i] = ranges.empty() ? SourceRange{} : ranges[i];
     textOff[i] = off;
     xpos[i] = wordXpos[i];
     styles[i] = static_cast<uint8_t>(wordStyles[i]);
@@ -155,6 +165,109 @@ bool TextBlock::hasRuby() const {
     if (!rt.empty()) return true;
   }
   return false;
+}
+
+struct TextBlock::RubyDrawInfo {
+  int x;
+  int width;
+  std::string text;
+  BidiUtils::BidiBaseDir baseDir;
+};
+
+// Resolve ruby collisions left-to-right to prevent adjacent ruby texts from overlapping.
+// wordShift[i] is how far word i moves right of its laid-out position to make room.
+void TextBlock::layoutRuby(const GfxRenderer& renderer, const int fontId, const int x, std::vector<int>& wordShift,
+                           std::vector<RubyDrawInfo>& rubies) const {
+  wordShift.assign(numWords, 0);
+  rubies.resize(numWords);
+  int accumulatedShift = 0;
+  int lastEnd = -9999;
+  for (uint16_t i = 0; i < numWords; i++) {
+    wordShift[i] = accumulatedShift;
+    if (i < rubyTexts.size() && !rubyTexts[i].empty() && (wordStyle(i) & EpdFontFamily::RUBY_CONTINUE) == 0) {
+      // Find the group size (how many words are part of this ruby annotation)
+      int groupWordCount = 1;
+      while (i + groupWordCount < numWords && (wordStyle(i + groupWordCount) & EpdFontFamily::RUBY_CONTINUE) != 0) {
+        groupWordCount++;
+      }
+
+      // Compute actual width for the group
+      int groupActualWidth = 0;
+      for (int k = 0; k < groupWordCount; ++k) {
+        groupActualWidth +=
+            renderer.getTextAdvanceX(fontId, wordText(i + k), wordStyle(i + k), blockStyle.letterSpacing);
+      }
+
+      const char* word = wordText(i);
+      const int leaderWordX = xposArr[i] + x;
+      const int leaderWordX_shifted = leaderWordX + accumulatedShift;
+      const auto baseDir =
+          static_cast<BidiUtils::BidiBaseDir>(BidiUtils::detectParagraphLevel(word, blockStyle.isRtl ? 1 : 0));
+      const int rubyWidth =
+          renderer.getTextAdvanceX(fontId, rubyTexts[i].c_str(), EpdFontFamily::SUP, blockStyle.letterSpacing);
+      const int screenWidth = renderer.getScreenWidth();
+
+      int rubyX = 0;
+      int groupDrawX = 0;
+      if (rubyWidth > groupActualWidth) {
+        rubyX = leaderWordX_shifted - (rubyWidth - groupActualWidth) / 2;
+        if (i == 0) {
+          rubyX = std::max(leaderWordX_shifted, rubyX);
+        }
+        if (rubyX < lastEnd) {
+          rubyX = lastEnd;
+        }
+        groupDrawX = rubyX + (rubyWidth - groupActualWidth) / 2;
+      } else {
+        groupDrawX = leaderWordX_shifted;
+        rubyX = groupDrawX + (groupActualWidth - rubyWidth) / 2;
+        if (i == 0) {
+          rubyX = std::max(leaderWordX_shifted, rubyX);
+        }
+        if (rubyX < lastEnd) {
+          const int push = lastEnd - rubyX;
+          rubyX = lastEnd;
+          groupDrawX += push;
+        }
+      }
+      rubyX = std::max(0, std::min(rubyX, screenWidth - rubyWidth));
+      // Keep groupDrawX aligned if rubyX was clamped by screen edges
+      if (rubyWidth > groupActualWidth) {
+        groupDrawX = rubyX + (rubyWidth - groupActualWidth) / 2;
+      }
+
+      rubies[i] = {rubyX, rubyWidth, rubyTexts[i], baseDir};
+      lastEnd = rubyX + rubyWidth;
+
+      // Propagate shift to all words in the group and subsequent words
+      const int groupShift = groupDrawX - leaderWordX;
+      accumulatedShift = groupShift;
+      for (int k = 0; k < groupWordCount; ++k) {
+        wordShift[i + k] = accumulatedShift;
+      }
+      i += groupWordCount - 1;
+    }
+  }
+}
+
+void TextBlock::wordPlacements(const GfxRenderer& renderer, const int baseFontId, const int x, const int y,
+                               const bool suppressRuby, std::vector<WordPlacement>& out) const {
+  out.clear();
+  if (!isValid) return;
+  const int fontId = blockStyle.resolveFontId(baseFontId);
+  std::vector<int> wordShift;
+  if (hasRuby()) {
+    std::vector<RubyDrawInfo> rubies;
+    layoutRuby(renderer, fontId, x, wordShift, rubies);
+  }
+  const int wordY = y + (suppressRuby ? 0 : getRubyShift(renderer.getFontAscenderSize(fontId)));
+  out.reserve(numWords);
+  for (uint16_t i = 0; i < numWords; i++) {
+    const int32_t fontSlot = fontsPresent ? wordFontArr[i] : 0;
+    const int wordFontId = (!isWordScaleTag(fontSlot) && fontSlot != 0) ? fontSlot : fontId;
+    const int wordX = xposArr[i] + x + (wordShift.empty() ? 0 : wordShift[i]);
+    out.push_back({static_cast<int16_t>(wordX), static_cast<int16_t>(wordY), wordFontId});
+  }
 }
 
 void TextBlock::render(const GfxRenderer& renderer, const int baseFontId, const int x, const int y,
@@ -190,92 +303,14 @@ void TextBlock::render(const GfxRenderer& renderer, const int baseFontId, const 
                               static_cast<EpdFontFamily::Style>(dropCap.style));
   }
 
-  // Resolve ruby collisions left-to-right to prevent adjacent ruby texts from overlapping
-  struct RubyDrawInfo {
-    int x;
-    int width;
-    std::string text;
-    BidiUtils::BidiBaseDir baseDir;
-  };
   // hasRuby() is an O(numWords) scan, so resolve it once here rather than per word.
   // Both arrays below are only ever read when the line carries ruby, so they stay
   // empty (zero allocations) for the ruby-less case, which is every line of a
-  // non-CJK book. Sized lazily inside the branch.
+  // non-CJK book.
   const bool blockHasRuby = hasRuby();
   std::vector<int> wordShiftArr;
   std::vector<RubyDrawInfo> rubies;
-  if (blockHasRuby) {
-    wordShiftArr.assign(numWords, 0);
-    rubies.resize(numWords);
-    int accumulatedShift = 0;
-    int lastEnd = -9999;
-    for (uint16_t i = 0; i < numWords; i++) {
-      wordShiftArr[i] = accumulatedShift;
-      if (i < rubyTexts.size() && !rubyTexts[i].empty() && (wordStyle(i) & EpdFontFamily::RUBY_CONTINUE) == 0) {
-        // Find the group size (how many words are part of this ruby annotation)
-        int groupWordCount = 1;
-        while (i + groupWordCount < numWords && (wordStyle(i + groupWordCount) & EpdFontFamily::RUBY_CONTINUE) != 0) {
-          groupWordCount++;
-        }
-
-        // Compute actual width for the group
-        int groupActualWidth = 0;
-        for (int k = 0; k < groupWordCount; ++k) {
-          groupActualWidth +=
-              renderer.getTextAdvanceX(fontId, wordText(i + k), wordStyle(i + k), blockStyle.letterSpacing);
-        }
-
-        const char* word = wordText(i);
-        const int leaderWordX = xposArr[i] + x;
-        const int leaderWordX_shifted = leaderWordX + accumulatedShift;
-        const auto baseDir =
-            static_cast<BidiUtils::BidiBaseDir>(BidiUtils::detectParagraphLevel(word, blockStyle.isRtl ? 1 : 0));
-        const int rubyWidth =
-            renderer.getTextAdvanceX(fontId, rubyTexts[i].c_str(), EpdFontFamily::SUP, blockStyle.letterSpacing);
-        const int screenWidth = renderer.getScreenWidth();
-
-        int rubyX = 0;
-        int groupDrawX = 0;
-        if (rubyWidth > groupActualWidth) {
-          rubyX = leaderWordX_shifted - (rubyWidth - groupActualWidth) / 2;
-          if (i == 0) {
-            rubyX = std::max(leaderWordX_shifted, rubyX);
-          }
-          if (rubyX < lastEnd) {
-            rubyX = lastEnd;
-          }
-          groupDrawX = rubyX + (rubyWidth - groupActualWidth) / 2;
-        } else {
-          groupDrawX = leaderWordX_shifted;
-          rubyX = groupDrawX + (groupActualWidth - rubyWidth) / 2;
-          if (i == 0) {
-            rubyX = std::max(leaderWordX_shifted, rubyX);
-          }
-          if (rubyX < lastEnd) {
-            const int push = lastEnd - rubyX;
-            rubyX = lastEnd;
-            groupDrawX += push;
-          }
-        }
-        rubyX = std::max(0, std::min(rubyX, screenWidth - rubyWidth));
-        // Keep groupDrawX aligned if rubyX was clamped by screen edges
-        if (rubyWidth > groupActualWidth) {
-          groupDrawX = rubyX + (rubyWidth - groupActualWidth) / 2;
-        }
-
-        rubies[i] = {rubyX, rubyWidth, rubyTexts[i], baseDir};
-        lastEnd = rubyX + rubyWidth;
-
-        // Propagate shift to all words in the group and subsequent words
-        const int groupShift = groupDrawX - leaderWordX;
-        accumulatedShift = groupShift;
-        for (int k = 0; k < groupWordCount; ++k) {
-          wordShiftArr[i + k] = accumulatedShift;
-        }
-        i += groupWordCount - 1;
-      }
-    }
-  }
+  if (blockHasRuby) layoutRuby(renderer, fontId, x, wordShiftArr, rubies);
 
   struct DecorationLineTracker {
     EpdFontFamily::Style style;
@@ -450,6 +485,7 @@ bool TextBlock::serialize(HalFile& file) const {
   serialization::writePod(file, numWords);
   serialization::writePod(file, static_cast<uint8_t>((focusPresent ? 1 : 0) | (fontsPresent ? 2 : 0)));
   serialization::writePod(file, textBytes);
+  serialization::writePod(file, paragraphStartWord);
   if (numWords > 0) {
     const size_t size = arenaSize(numWords, focusPresent, fontsPresent, textBytes);
     if (file.write(arena.get(), size) != size) {
@@ -499,13 +535,15 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(HalFile& file) {
   uint16_t wc;
   uint8_t flags;
   uint16_t textBytes;
+  uint16_t paragraphStartWord;
   serialization::readPod(file, wc);
   serialization::readPod(file, flags);
   serialization::readPod(file, textBytes);
+  serialization::readPod(file, paragraphStartWord);
 
   // Sanity checks: cap the arena allocation and reject impossible geometry
   // (every word carries at least its NUL terminator).
-  if (wc > 10000) {
+  if (wc > 10000 || (paragraphStartWord != UINT16_MAX && paragraphStartWord >= wc)) {
     LOG_ERR("TXB", "Deserialization failed: word count %u exceeds maximum", wc);
     return nullptr;
   }
@@ -525,6 +563,7 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(HalFile& file) {
   }
   block->numWords = wc;
   block->textBytes = textBytes;
+  block->paragraphStartWord = paragraphStartWord;
   block->focusPresent = (flags & 1) != 0;
   block->fontsPresent = (flags & 2) != 0;
 

@@ -12,6 +12,10 @@
 
 #include "HalGPIO.h"
 
+#if FREEINK_DEVICE_EEGO_A4
+#include <HalFrontlight.h>
+#endif
+
 #if FREEINK_DEVICE_PAPERMONO
 #include <M5Pm1.h>
 #endif
@@ -70,6 +74,11 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 }
 
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+#if FREEINK_DEVICE_EEGO_A4
+  // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+  Frontlight.setOn(false);
+  gpio.prepareForDeepSleep();
+#endif
 #ifdef ENABLE_SERIAL_LOG
   // Tear down HWCDC so the host sees a clean disconnect and the peripheral
   // doesn't hold power domains that interfere with USB-powered GPIO wake.
@@ -129,6 +138,13 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   if (freeink::m5pm1::requestShutdown()) {
     delay(1000);  // allow the PMIC firmware time to drop power
   }
+#endif
+#if FREEINK_DEVICE_METALIO_EINK4
+  // ESP deep sleep leaves the whole board powered (main and screen/SD rails, 4G modem, Bluetooth
+  // audio module), so sleep means off: powerOff() runs the vendor's power-key sequence and does not
+  // return on battery. The power button then cold-boots. With USB holding power up it returns, and
+  // the device deep-sleeps instead.
+  freeink::metalio::powerOff();
 #endif
 
   // Waits for the power button to be physically released (so holding it doesn't

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "CrossPointSettings.h"
+#include "HapticFeedback.h"
 #include "MappedInputManager.h"
 #include "ReadingStatsStore.h"
 #include "components/HomeTabBar.h"
@@ -114,6 +115,7 @@ bool ReadingStatsActivity::stepMonthFromTap() {
   } else {
     return false;
   }
+  haptic_feedback::touchAction();
   requestUpdate();
   return true;
 }
@@ -298,7 +300,7 @@ void ReadingStatsActivity::render(RenderLock&&) {
   // Redraw header and band on top of scrolled content so text doesn't bleed through.
   renderer.fillRect(0, 0, screen.width, headerBottom - metrics.verticalSpacing, false);
   GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
-                 tr(STR_STATS), nullptr, HomeTabBar::showsBackButton(true));
+                 tr(STR_STATS), nullptr, HomeTabBar::showsBackButton(true), UiTabBand::drawsTopRule() ? 0 : -1);
   // Kept for loop(), so a tap in the band's gaps is swallowed. Drawn focused while the cursor is
   // on the page: Confirm acts on the tabs there and nothing else.
   tabBar = Rect{0, tabBarY, screen.width, tabBarH};

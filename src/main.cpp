@@ -15,7 +15,9 @@
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <SPI.h>
+#include <TrustedTime.h>
 #include <VectorFontSupport.h>
 #include <WiFi.h>
 #include <XteinkDetect.h>
@@ -32,9 +34,11 @@
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
+#include "WifiCredentialStore.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/reader/EpubReaderTranslationActivity.h"
+#include "activities/settings/ClockSyncActivity.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/HomeTabBar.h"
 #include "components/LibraryTabs.h"
@@ -42,6 +46,7 @@
 #include "fontIds.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
+#include "util/PluginEvents.h"
 #include "util/ScreenshotUtil.h"
 #include "util/Timezones.h"
 
@@ -166,7 +171,9 @@ constexpr uint32_t SILENT_REBOOT_TARGET_TRANSLATE = 2;
 constexpr uint32_t SILENT_REBOOT_TARGET_SETTINGS = 3;
 // A Cover Grid tab screen; which one rides in silentRebootPayload's second byte.
 constexpr uint32_t SILENT_REBOOT_TARGET_TAB = 4;
-constexpr uint32_t SILENT_REBOOT_TARGET_MAX = SILENT_REBOOT_TARGET_TAB;  // bounds the setup() range check
+// File Transfer > Join Network, entered through a reboot for a fresh heap (upstream's 3).
+constexpr uint32_t SILENT_REBOOT_TARGET_JOIN_NETWORK = 5;
+constexpr uint32_t SILENT_REBOOT_TARGET_MAX = SILENT_REBOOT_TARGET_JOIN_NETWORK;  // bounds the setup() range check
 // Bit in silentRebootPayload, which is a separate word from the target above -- the two
 // never share bits.
 constexpr uint32_t SILENT_REBOOT_LIGHT_ON = 1U << 0;
@@ -249,6 +256,21 @@ void silentRestart() { silentRestartTo(SILENT_REBOOT_TARGET_HOME, "home"); }
 void silentRestartToReader() { silentRestartTo(SILENT_REBOOT_TARGET_READER, "reader"); }
 
 void silentRestartToSettings() { silentRestartTo(SILENT_REBOOT_TARGET_SETTINGS, "settings"); }
+
+void silentRestartToJoinNetwork() {
+  if (deepSleepInProgress) return;
+#if FREEINK_CAP_TOUCH
+  // A software reset would cycle touch/frontlight rails; those boards proceed
+  // into Join Network without the fresh-heap reboot (return, don't stop WiFi —
+  // this runs on the way *in*, unlike the exit-time silentRestart()).
+  if (BoardConfig::hasTouch()) return;
+#endif
+  armSilentReboot(SILENT_REBOOT_TARGET_JOIN_NETWORK);
+  LOG_DBG("MAIN", "Silent restart (target=join-network)");
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
 
 void silentRestartToHomeTab(const int homeTab) {
   silentRestartTo(SILENT_REBOOT_TARGET_TAB, "tab", static_cast<uint32_t>(homeTab));
@@ -340,10 +362,72 @@ static bool loadSleepFrameBuffer() {
   return true;
 }
 
+// Plugin-event delivery on the way into deep sleep. sleep.enter is delivered
+// now — over the live connection, or by bringing WiFi up when a plugin
+// subscribes (e.g. fetching a fresh /sleep.bmp so THIS sleep shows it — the
+// drain runs before goToSleep() renders the sleep screen). The connect path
+// is bounded (join deadline + drain event budget), skipped on low battery,
+// and sleep is never blocked on the network: a failed join or delivery just
+// sleeps with the previous image and the queued events retry on the next
+// drain (at-least-once). The caller's WiFi shutdown tears the radio down
+// either way. Deferrable events already queued (reader.exit) ride along in
+// the same drain.
+static void deliverSleepPluginEvents() {
+  // Activity-owned state must be queued before sleep.enter and before this
+  // same-sleep drain. The hook is idempotent with ordinary activity teardown.
+  activityManager.prepareForSleep();
+
+  // Sleeping straight out of a book is the common flow, but the reader's own
+  // reader.exit only fires later, inside goToSleep() — after this drain. Carry
+  // the book and progress on sleep.enter itself so a sync handler bound to it
+  // pushes current progress on THIS connection, not the next one.
+  pluginevents::Var vars[2];
+  size_t varCount = 0;
+  char percent[8];
+  const ScreenshotInfo info = activityManager.getScreenshotInfo();
+  if (info.readerType != ScreenshotInfo::ReaderType::None && !APP_STATE.openEpubPath.empty()) {
+    snprintf(percent, sizeof(percent), "%d", info.progressPercent);
+    vars[varCount++] = {"book", APP_STATE.openEpubPath.c_str()};
+    vars[varCount++] = {"percent", percent};
+  }
+  pluginevents::emit(pluginevents::Event::SleepEnter, vars, varCount);
+  if (WiFi.status() == WL_CONNECTED) {
+    pluginevents::drain(&renderer);
+    return;
+  }
+  // Any connect-flagged queued event justifies the join, not only
+  // sleep.enter: reader.session is queued while reading and delivered on this
+  // same sleep, and a progress-sync plugin usually subscribes to it alone.
+  if (!pluginevents::wantsConnectAny()) return;
+  if (powerManager.getBatteryPercentage() < 20) return;
+  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
+  if (!cred) return;
+
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+  const unsigned long joinDeadline = millis() + 10000;
+  while (WiFi.status() != WL_CONNECTED && millis() < joinDeadline) {
+    delay(100);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    trustedtime::startSync();  // snap the clock floor while the network is up
+    pluginevents::drain(&renderer);
+  } else {
+    LOG_DBG("MAIN", "Sleep-event WiFi join timed out; deferring delivery");
+  }
+}
+
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+
+  // Sleep may end in a power-off (battery death, latch); persist the clock
+  // floor now so a later cold boot resumes from it.
+  trustedtime::note();
+
+  deliverSleepPluginEvents();
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -488,7 +572,10 @@ void setup() {
   // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
   // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
   // only SD state survives to the next boot.
-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
+  // The Metalio's power-switch chip already demanded a real press, and the board usually boots after
+  // the button is released: a hold check there would power it straight back off.
+  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || BoardConfig::isMetalioEInk4() ||
+                                gpio.verifyPowerButtonWakeup();
 
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
@@ -554,6 +641,10 @@ void setup() {
   OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
+  pluginevents::refreshSubscriptions();
+  // Restore the monotonic clock floor before anything reads time() (event
+  // timestamps, loan-expiry checks).
+  trustedtime::init();
 
   // Brightness and warmth are always restored. A normal wake starts with the
   // light off unless Restore Light on Wake is enabled; silent maintenance
@@ -577,10 +668,12 @@ void setup() {
     case HalGPIO::WakeupReason::AfterUSBPower:
       // Most devices return to sleep after a USB-powered cold boot.
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-#if FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_EEGO_A4
+#if FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_EEGO_A4 || \
+    FREEINK_DEVICE_METALIO_EINK4
       // X4 Pro must stay awake so USB Serial/JTAG remains available after leaving
       // USB Drive and reconnecting the cable. Paper Mono has no armable GPIO wake
-      // (its button is behind the PMIC). EEGO A4's post-flash reset reads as
+      // (its button is behind the PMIC). Metalio also needs native USB available
+      // after a USB-powered boot. EEGO A4's post-flash reset reads as
       // POWERON (native-USB), so a flash would otherwise be misclassified as a
       // USB-power cold boot and sleep. Sleeping any of these here would strand
       // the device in a USB-replug boot loop (or sleep right after a flash).
@@ -683,6 +776,10 @@ void setup() {
     } else {
       activityManager.goHome();
     }
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_JOIN_NETWORK) {
+    // Rebooted on the way *into* File Transfer > Join Network for a fresh heap;
+    // resume that flow directly instead of landing on home.
+    activityManager.goToJoinNetwork();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_SETTINGS) {
     // Back out of the WiFi rows and the user is where they left off, not on Home.
     activityManager.goToSettings();
@@ -725,6 +822,43 @@ void setup() {
   allowSleepAt = millis() + 2000;
 }
 
+// A two-button shortcut: Power held together with a side button. The action runs once per
+// press, and the power release that ends it is swallowed so it does not also run the short
+// power-button action.
+struct PowerCombo {
+  bool armed = true;
+  bool active = false;
+};
+
+// True while the combination owns this loop tick.
+static bool pollPowerCombo(PowerCombo& combo, const uint8_t otherButton, void (*action)()) {
+  if (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.isPressed(otherButton)) {
+    combo.active = true;
+    if (combo.armed) {
+      combo.armed = false;
+      action();
+    }
+    return true;
+  }
+  if (!combo.active) return false;
+  if (gpio.isPressed(HalGPIO::BTN_POWER)) return true;
+  const bool powerReleased = gpio.wasReleased(HalGPIO::BTN_POWER);
+  combo.armed = true;
+  combo.active = false;
+  return powerReleased;
+}
+
+static void startClockSyncFromCombo() {
+  if (ClockSyncActivity::isRunning()) return;
+  // From a book the sync returns to the book; from anywhere else it ends as the Settings row does.
+  auto sync = makeUniqueNoThrow<ClockSyncActivity>(renderer, mappedInputManager, activityManager.isReaderActivity());
+  if (!sync) {
+    LOG_ERR("MAIN", "OOM: ClockSyncActivity");
+    return;
+  }
+  activityManager.pushActivity(std::move(sync));
+}
+
 void loop() {
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
@@ -756,6 +890,13 @@ void loop() {
   }
 
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
+
+  // Under the render lock, so a step never overlaps the themes' gauge reads.
+  static bool gaugeCapacityPending = true;
+  if (gaugeCapacityPending) {
+    RenderLock lock(RenderLock::Try{});
+    if (lock.held()) gaugeCapacityPending = BatteryMonitor::loadDesignCapacity();
+  }
 
   // The sunlight workaround was designed for X4. On X3, powering the panel off after
   // every update forces the stronger wake waveform on the next refresh and causes severe
@@ -818,6 +959,16 @@ void loop() {
       } else if (cmd == "HOME") {
         LOG_INF("CMD", "home");
         activityManager.goHome();
+      } else if (cmd == "MEM") {
+        // The heap now, rather than at the next ten-second tick: for measuring one screen.
+        const auto heap = HalMemory::getInternalHeap();
+        LOG_INF("CMD", "mem free=%zu min=%zu maxAlloc=%zu", heap.freeBytes, heap.minFreeBytes, heap.largestBlockBytes);
+      } else if (cmd == "CLOCKSYNC") {
+        // The Power + Up action; injected presses are queued one at a time, so the combination
+        // itself cannot be sent.
+        LOG_INF("CMD", "clock sync");
+        powerManager.setPowerSaving(false);  // as the button press would: Wi-Fi cannot start throttled
+        startClockSyncFromCombo();
       } else if (cmd.startsWith("PRESS:") || cmd.startsWith("HOLD:")) {
         // PRESS:<BTN> is a tap; HOLD:<BTN>:<ms> keeps the button down that long (long presses,
         // key repeat). Hardware button index, not the logical (remappable) one.
@@ -865,29 +1016,17 @@ void loop() {
     return;
   }
 
-  static bool screenshotButtonsReleased = true;
-  static bool screenshotComboActive = false;
-  if (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.isPressed(HalGPIO::BTN_DOWN)) {
-    screenshotComboActive = true;
-    if (screenshotButtonsReleased) {
-      screenshotButtonsReleased = false;
-      {
+  // Power + Down: screenshot. Power + Up, when switched on in Shortcuts: sync the clock (devices
+  // without a clock chip drift while asleep, which skews the reading stats).
+  static PowerCombo screenshotCombo;
+  static PowerCombo clockSyncCombo;
+  if (pollPowerCombo(screenshotCombo, HalGPIO::BTN_DOWN, [] {
         RenderLock lock;
         ScreenshotUtil::takeScreenshot(renderer);
-      }
-    }
+      })) {
     return;
   }
-  if (screenshotComboActive) {
-    if (gpio.isPressed(HalGPIO::BTN_POWER)) return;
-    if (gpio.wasReleased(HalGPIO::BTN_POWER)) {
-      screenshotButtonsReleased = true;
-      screenshotComboActive = false;
-      return;
-    }
-    screenshotButtonsReleased = true;
-    screenshotComboActive = false;
-  }
+  if (SETTINGS.powerUpClockSync && pollPowerCombo(clockSyncCombo, HalGPIO::BTN_UP, startClockSyncFromCombo)) return;
 
   // Consume the second X4 Pro power-button release so it does not also run a
   // configured short-power action after toggling the frontlight.
@@ -951,8 +1090,8 @@ void loop() {
 
   if (!x4ProAwaitingClickWindow && powerReleasedSinceWake && millis() >= allowSleepAt &&
       gpio.isPressed(HalGPIO::BTN_POWER) && gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
-    // If the screenshot combination is potentially being pressed, don't sleep
-    if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
+    // If a power-button combination is potentially being pressed, don't sleep
+    if (gpio.isPressed(HalGPIO::BTN_DOWN) || (SETTINGS.powerUpClockSync && gpio.isPressed(HalGPIO::BTN_UP))) {
       return;
     }
     LOG_DBG("MAIN", "Power button held %lums, sleeping", gpio.getPowerButtonHeldTime());
@@ -1047,7 +1186,12 @@ void loop() {
       const unsigned long idleStart = millis();
       while (millis() - idleStart < 50) {
         delay(10);
-        if (gpio.rawInputActive()) break;
+        if (gpio.rawInputActive()) {
+          // Back to full clock before the press is even debounced: the poll, the activity's
+          // handler and the render that follows would otherwise all start at 10 MHz.
+          powerManager.setPowerSaving(false);
+          break;
+        }
       }
     } else {
       // Short delay to prevent tight loop while still being responsive

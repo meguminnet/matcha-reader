@@ -12,7 +12,7 @@
 #include "FsHelpers.h"
 
 namespace {
-constexpr uint8_t BOOK_CACHE_VERSION = 10;  // v10: ignore ambiguous guide text references
+constexpr uint8_t BOOK_CACHE_VERSION = 11;  // v11: spine page-progression-direction flag
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -196,7 +196,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       sizeof(BOOK_CACHE_VERSION) + /* LUT Offset */ sizeof(uint32_t) + sizeof(spineCount) + sizeof(tocCount);
   const uint32_t metadataSize = metadata.title.size() + metadata.author.size() + metadata.language.size() +
                                 metadata.coverItemHref.size() + metadata.textReferenceHref.size() +
-                                sizeof(uint32_t) * 5;
+                                sizeof(uint32_t) * 5 + sizeof(uint8_t);
   const uint32_t lutSize = sizeof(uint32_t) * spineCount + sizeof(uint32_t) * tocCount;
   const uint32_t lutOffset = headerASize + metadataSize;
 
@@ -211,6 +211,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   serialization::writeString(bookOut, metadata.language);
   serialization::writeString(bookOut, metadata.coverItemHref);
   serialization::writeString(bookOut, metadata.textReferenceHref);
+  serialization::writePod(bookOut, static_cast<uint8_t>(metadata.pageProgressionRtl ? 1 : 0));
 
   // Loop through spine entries, writing LUT positions
   spineIn.seek(0);
@@ -263,8 +264,8 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     // NOTE: We intentionally skip calling loadAllFileStatSlims() here.
     // For large EPUBs (2000+ chapters), pre-loading all ZIP central directory entries
     // into memory causes OOM crashes on ESP32-C3's limited ~380KB RAM.
-    // Instead, for large books we use a one-pass batch lookup that scans the ZIP
-    // central directory once and matches against spine targets using hash comparison.
+    // Instead, for large books we use a batch lookup that scans the ZIP central
+    // directory once per chunk and matches against spine targets using hash comparison.
     // This is O(n*log(m)) instead of O(n*m) while avoiding memory exhaustion.
     // See: https://github.com/crosspoint-reader/crosspoint-reader/issues/134
 
@@ -272,7 +273,8 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       LOG_DBG("BMC", "Using batch size lookup for %d spine items", spineCount);
 
       std::deque<ZipFile::SizeTarget> targets;
-      targets.resize(spineCount);
+      spineSizes.emplace(spineCount, 0);
+      int matched = 0;
 
       spineIn.seek(0);
       for (int i = 0; i < spineCount; i++) {
@@ -283,15 +285,16 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
         t.hash = ZipFile::fnvHash64(path.c_str(), path.size());
         t.len = static_cast<uint16_t>(path.size());
         t.index = static_cast<uint16_t>(i);
-        targets[i] = t;
+        targets.push_back(t);
+        // Targets take 16 B per spine item, so look sizes up 2,048 items at a time.
+        if (targets.size() < 2048 && i + 1 < spineCount) continue;
+
+        std::sort(targets.begin(), targets.end(), [](const ZipFile::SizeTarget& a, const ZipFile::SizeTarget& b) {
+          return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
+        });
+        matched += zip.fillUncompressedSizes(targets, *spineSizes);
+        targets.clear();
       }
-
-      std::sort(targets.begin(), targets.end(), [](const ZipFile::SizeTarget& a, const ZipFile::SizeTarget& b) {
-        return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
-      });
-
-      spineSizes.emplace(spineCount, 0);
-      int matched = zip.fillUncompressedSizes(targets, *spineSizes);
       LOG_DBG("BMC", "Batch lookup matched %d/%d spine items", matched, spineCount);
     }
   } else {
@@ -468,13 +471,16 @@ bool BookMetadataCache::load() {
   // A cache file that cannot be read through is treated as absent, not as a book with empty
   // metadata: the caller rebuilds it, where a half-loaded cache would be believed and kept.
   // This is the path that aborted on a device whose SD card was failing mid-read.
+  uint8_t pageProgressionRtl = 0;
   const bool headerOk = serialization::readPod(bookFile, lutOffset) && serialization::readPod(bookFile, spineCount) &&
                         serialization::readPod(bookFile, tocCount) &&
                         serialization::readString(bookFile, coreMetadata.title) &&
                         serialization::readString(bookFile, coreMetadata.author) &&
                         serialization::readString(bookFile, coreMetadata.language) &&
                         serialization::readString(bookFile, coreMetadata.coverItemHref) &&
-                        serialization::readString(bookFile, coreMetadata.textReferenceHref);
+                        serialization::readString(bookFile, coreMetadata.textReferenceHref) &&
+                        serialization::readPod(bookFile, pageProgressionRtl);
+  coreMetadata.pageProgressionRtl = pageProgressionRtl != 0;
   if (!headerOk) {
     LOG_ERR("BMC", "Cache header unreadable or corrupt; discarding");
     bookFile.close();

@@ -24,6 +24,7 @@
 #include "CrossPointState.h"
 #include "EpubReaderPercentSelectionActivity.h"
 #include "EpubReaderTranslationActivity.h"
+#include "HapticFeedback.h"
 #include "MangaBookmarksActivity.h"
 #include "MangaChapterSelectionActivity.h"
 #include "MangaWordLookupActivity.h"
@@ -40,6 +41,7 @@
 #include "fontIds.h"
 #include "util/BookmarkFile.h"
 #include "util/BookmarkUtil.h"
+#include "util/CjkScript.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -66,6 +68,15 @@ constexpr uint32_t PREFETCH_HEAP_FLOOR = 60000;
 constexpr uint32_t PREFETCH_TASK_STACK = 8192;
 }  // namespace
 
+namespace {
+// Script of the comic, for the companion font and dictionary folder. Folders converted before
+// convert_manga.py recorded a language, or from a source without one, are Japanese manga.
+CjkScript mangaScript(const manga::MangaBook* book) {
+  const CjkScript script = book ? cjk::scriptForLanguage(book->getLanguage()) : CjkScript::None;
+  return script == CjkScript::None ? CjkScript::Japanese : script;
+}
+}  // namespace
+
 void MangaReaderActivity::onEnter() {
   Activity::onEnter();
 
@@ -79,7 +90,7 @@ void MangaReaderActivity::onEnter() {
     {
       RenderLock lock;
       sdFontSystem.releaseAllResidentFonts(renderer);
-      sdFontSystem.setJpFallbackNeeded(renderer, false);
+      sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
     }
     book = makeUniqueNoThrow<manga::MangaBook>(std::move(pendingBookPath));
     if (!book) {
@@ -101,6 +112,9 @@ void MangaReaderActivity::onEnter() {
       finish();
       return;
     }
+    // The converted dictionary lives in a per-language folder; pick the comic's before the first
+    // DictIndex::isAvailable() decides whether Word Lookup is offered.
+    DictIndex::setLanguageFolder(cjk::dictFolderFor(book->getLanguage(), mangaScript(book.get())));
   }
 
   // Which layout this book's panel crops use. Newer conversions put them in a subfolder so the
@@ -204,6 +218,7 @@ void MangaReaderActivity::onExit() {
   }
 
   saveProgress();
+  flushReaderSession();
   endOfBookOptionsReady.store(false, std::memory_order_release);
   endOfBookOptions.reset();
   panels.clear();
@@ -220,7 +235,7 @@ void MangaReaderActivity::onExit() {
   // released it only from RAM; ensureLoaded() restores the unchanged saved selection here.
   {
     RenderLock lock;
-    sdFontSystem.setJpFallbackNeeded(renderer, false);
+    sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
     sdFontSystem.ensureLoaded(renderer);
   }
 
@@ -512,6 +527,8 @@ bool MangaReaderActivity::renderEndOfBook() {
                               EpdFontFamily::BOLD);
   }
   renderer.displayBuffer();
+  // Credits the last page's dwell and brings the session's progress to the end of the book.
+  sessionReporter_.pageRendered(progressBasisPoints());
   return true;
 }
 
@@ -597,6 +614,7 @@ void MangaReaderActivity::loop() {
   }
 
   if (holdGlyph >= 0) {
+    haptic_feedback::touchAction(/*longPress=*/true);
     launchWordLookupAt(std::move(holdText), holdGlyph);
     return;
   }
@@ -683,6 +701,7 @@ void MangaReaderActivity::loop() {
     if (ignoreNextConfirmRelease) {
       ignoreNextConfirmRelease = false;
     } else if (viewMode == ViewMode::PanelZoom || viewMode == ViewMode::FullPage) {
+      if (touchMenu) haptic_feedback::touchAction();
       launchMenu();
       return;
     }
@@ -733,6 +752,12 @@ void MangaReaderActivity::loop() {
 
   if (handleEndOfBookPageTurn(prevTriggered, nextTriggered)) return;
 
+  // What the turn below may change, to tell a turn that happened from one that was refused
+  // (Previous on the first page).
+  const uint32_t pageBefore = currentPage;
+  const int panelBefore = currentPanel;
+  const ViewMode modeBefore = viewMode;
+
   if (viewMode == ViewMode::PanelZoom) {
     if (nextTriggered) nextPanel();
     if (prevTriggered) prevPanel();
@@ -758,6 +783,26 @@ void MangaReaderActivity::loop() {
     }
     if (prevTriggered) prevPage();
   }
+
+  const bool moved = currentPage != pageBefore || currentPanel != panelBefore || viewMode != modeBefore;
+  // A panel step is reading, the same as a page turn.
+  sessionReporter_.noteTurn(nextTriggered && !prevTriggered, moved);
+  if (moved && (touch.prev || touch.next)) haptic_feedback::touchAction();
+}
+
+void MangaReaderActivity::prepareForSleep() { flushReaderSession(); }
+
+// A manga book is a folder, so its document id comes from the panel index inside it: one file
+// per book, written once at conversion.
+void MangaReaderActivity::flushReaderSession() {
+  if (!book) return;
+  sessionReporter_.flush(book->getFolder(), book->getFolder() + "/panels.idx");
+}
+
+int MangaReaderActivity::progressBasisPoints() const {
+  if (!book || book->getPageCount() == 0) return 0;
+  if (currentPage >= book->getPageCount()) return 10000;
+  return static_cast<int>(static_cast<uint64_t>(currentPage) * 10000 / book->getPageCount());
 }
 
 void MangaReaderActivity::render(RenderLock&&) {
@@ -786,6 +831,7 @@ void MangaReaderActivity::render(RenderLock&&) {
   }
 
   saveProgress();
+  sessionReporter_.pageRendered(progressBasisPoints());
 
   if (translationAfterRender.load(std::memory_order_relaxed)) {
     translationPageReady.store(true, std::memory_order_release);
@@ -1680,8 +1726,7 @@ void MangaReaderActivity::launchWordLookupCurrentView() {
   // without having to zoom into each panel individually.
   if (!book) return;
   if (!DictIndex::isAvailable()) {
-    LOG_ERR("MANGA", "Word lookup: no Japanese dictionary (%s / %s)", DictIndex::vocabIdxPath(),
-            DictIndex::vocabDatPath());
+    LOG_ERR("MANGA", "Word lookup: no dictionary (%s / %s)", DictIndex::vocabIdxPath(), DictIndex::vocabDatPath());
     return;
   }
   LOG_DBG("MANGA", "Word lookup: page %u panel %d", static_cast<unsigned>(currentPage), currentPanel);
@@ -1837,12 +1882,12 @@ void MangaReaderActivity::launchWordLookupAt(std::string combined, const int gly
   if (!book || !DictIndex::isAvailable()) return;
   const ViewMode returnMode = viewMode;
   if (combined.empty()) return;
-  // Dictionary text needs the Japanese SD fallback. Restore it only for the child activity, then
-  // return its memory to the page decoder before the manga redraws.
+  // Dictionary text needs the comic's CJK SD fallback. Restore it only for the child activity,
+  // then return its memory to the page decoder before the manga redraws.
   {
     RenderLock lock;
     sdFontSystem.ensureLoaded(renderer);
-    sdFontSystem.setJpFallbackNeeded(renderer, true);
+    sdFontSystem.setCjkFallbackNeeded(renderer, mangaScript(book.get()));
   }
   auto lookup = makeUniqueNoThrow<MangaWordLookupActivity>(
       renderer, mappedInput, std::move(combined), book->getCachePath() + "/wlscan.bin",
@@ -1851,7 +1896,7 @@ void MangaReaderActivity::launchWordLookupAt(std::string combined, const int gly
     LOG_ERR("MRA", "OOM: word lookup");
     RenderLock lock;
     sdFontSystem.releaseAllResidentFonts(renderer);
-    sdFontSystem.setJpFallbackNeeded(renderer, false);
+    sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
     return;
   }
   lookup->setMiningContext({book->getTitle(), book->getAuthor(), {}, book->getLanguage(), book->getFolder()});
@@ -1859,7 +1904,7 @@ void MangaReaderActivity::launchWordLookupAt(std::string combined, const int gly
     {
       RenderLock lock;
       sdFontSystem.releaseAllResidentFonts(renderer);
-      sdFontSystem.setJpFallbackNeeded(renderer, false);
+      sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
       viewMode = returnMode;
     }
     requestUpdate();
@@ -1885,7 +1930,7 @@ void MangaReaderActivity::launchWordLookup() {
   {
     RenderLock lock;
     sdFontSystem.ensureLoaded(renderer);
-    sdFontSystem.setJpFallbackNeeded(renderer, true);
+    sdFontSystem.setCjkFallbackNeeded(renderer, mangaScript(book.get()));
   }
 
   // Use the MangaWordLookup sub-activity with raw text. The scan cache makes a re-open of the
@@ -1897,7 +1942,7 @@ void MangaReaderActivity::launchWordLookup() {
     LOG_ERR("MRA", "OOM: word lookup");
     RenderLock lock;
     sdFontSystem.releaseAllResidentFonts(renderer);
-    sdFontSystem.setJpFallbackNeeded(renderer, false);
+    sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
     return;
   }
   lookup->setMiningContext({book->getTitle(), book->getAuthor(), {}, book->getLanguage(), book->getFolder()});
@@ -1905,7 +1950,7 @@ void MangaReaderActivity::launchWordLookup() {
     {
       RenderLock lock;
       sdFontSystem.releaseAllResidentFonts(renderer);
-      sdFontSystem.setJpFallbackNeeded(renderer, false);
+      sdFontSystem.setCjkFallbackNeeded(renderer, CjkScript::None);
       viewMode = ViewMode::PanelZoom;
     }
     requestUpdate();
@@ -2120,7 +2165,7 @@ void MangaReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
         sdFontSystem.ensureLoaded(renderer);
       }
       startActivityForResult(std::make_unique<SettingsActivity>(renderer, mappedInput, /*initialCategory=*/1,
-                                                                /*finishOnBack=*/true, /*japaneseBook=*/true,
+                                                                /*finishOnBack=*/true, mangaScript(book.get()),
                                                                 /*dictionaryLanguage=*/std::string{},
                                                                 /*showReaderToggles=*/false,
                                                                 /*verticalTextEnabled=*/false,
