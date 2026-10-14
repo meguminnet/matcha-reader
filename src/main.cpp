@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <BlePageTurner.h>
 #include <BoardConfig.h>
+#if FREEINK_DEVICE_LILYGO
+#include <BoardT5S3.h>
+#endif
 #include <Epub.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
@@ -585,6 +588,12 @@ void setup() {
 #endif
 
   HalSystem::begin();
+#if FREEINK_DEVICE_LILYGO
+  // The SDK leaves T5 S3 board bring-up to the firmware: I2C (expander, EPD
+  // PMIC, touch, gauge), the expander button hook, and deselecting the LoRa
+  // radio on the shared SD bus. Must run before gpio.begin() and Storage.begin().
+  BoardT5S3::begin();
+#endif
   // checkPanic() clears the watchdog capture marker after a successful SD
   // dump, so retain the boot classification for the later activity route.
   const bool rebootedFromPanic = HalSystem::isRebootFromPanic();
