@@ -23,10 +23,10 @@ class GfxRenderer;
 // starting black post-invert -- the calibrated start state the gray nudge expects.
 namespace GrayLogo {
 constexpr int WIDTH = 230;
-constexpr int HEIGHT = 324;
+constexpr int HEIGHT = 308;
 // The smaller copy, for the Departures sleep screen on short panels.
 constexpr int SMALL_WIDTH = 130;
-constexpr int SMALL_HEIGHT = 183;
+constexpr int SMALL_HEIGHT = 174;
 
 enum class Size : uint8_t { Regular, Small };
 // Wordmark and status line sit at the bottom of the screen, under the poster-size cat.
