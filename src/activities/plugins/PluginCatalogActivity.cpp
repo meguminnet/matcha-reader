@@ -94,7 +94,7 @@ class TlsHeapScope {
   ~TlsHeapScope() {
     if (!slabSuspended) return;
     RenderLock lock;
-    if (auto* fcm = renderer.getFontCacheManager()) {
+    if (const auto* fcm = renderer.getFontCacheManager()) {
       if (auto* fd = fcm->getDecompressor()) fd->setSlabEnabled(true);
     }
   }
