@@ -372,7 +372,7 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   // The TLS handshake fails with MEMORY_E once the Wi-Fi stack leaves too little free heap. SD-font
   // caches filled by the screen we came from (the Library's CJK titles) can hold tens of KB; drop
   // them only when short, since a CJK catalog would otherwise reload its glyphs on every page.
-  if (ESP.getFreeHeap() < FETCH_FREE_HEAP_FLOOR) {
+  if (HttpDownloader::heapShortForTls()) {
     if (auto* fcm = renderer.getFontCacheManager()) fcm->releaseAllFontMemory();
   }
   LOG_INF("OPDS", "Fetching (%u free, %u max block): %s", ESP.getFreeHeap(), ESP.getMaxAllocHeap(), url.c_str());

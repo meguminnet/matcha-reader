@@ -33,6 +33,12 @@ class HttpDownloader {
   // downloadToFile() and fail into their error UI instead.
   static constexpr uint32_t MIN_TLS_FREE_HEAP = 40000;
   static constexpr uint32_t MIN_TLS_MAX_ALLOC = 20000;
+  // Below either figure, callers release rebuildable font caches before a TLS request. The free
+  // heap figure is measured (38 KB failed the handshake, 66 KB succeeded); the block figure leaves
+  // headroom over one ~17KB record.
+  static constexpr uint32_t RELEASE_FONTS_FREE_HEAP = 60000;
+  static constexpr uint32_t RELEASE_FONTS_MAX_ALLOC = 32000;
+  static bool heapShortForTls();
 
   using Header = std::pair<std::string, std::string>;
 

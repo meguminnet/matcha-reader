@@ -159,9 +159,6 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   // value, or -1 for Home.
   static constexpr int LIBRARY_TAB_BASE = 16;
   int exitTarget = -1;
-  // Free heap under which a feed fetch first drops the SD-font caches: 38 KB failed the TLS
-  // handshake, 66 KB succeeded.
-  static constexpr uint32_t FETCH_FREE_HEAP_FLOOR = 60000;
   void downloadBook(const OpdsEntry& book);
   void openPublicationDetail(const OpdsEntry& entry);
   static void fillDetailInfo(const OpdsPublication& publication, DetailsSpec& spec);

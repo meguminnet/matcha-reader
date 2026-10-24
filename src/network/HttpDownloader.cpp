@@ -308,3 +308,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   LOG_DBG("HTTP", "Downloaded %zu bytes", downloaded);
   return OK;
 }
+
+bool HttpDownloader::heapShortForTls() {
+  return ESP.getFreeHeap() < RELEASE_FONTS_FREE_HEAP || ESP.getMaxAllocHeap() < RELEASE_FONTS_MAX_ALLOC;
+}

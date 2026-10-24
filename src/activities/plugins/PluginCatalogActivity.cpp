@@ -66,10 +66,6 @@ constexpr size_t MAX_BROWSE_RESPONSE = 1024 * 1024;
 constexpr size_t MAX_BROWSE_LIST_INDEX_RESPONSE = 16 * 1024;
 constexpr size_t MAX_ITEM_DETAILS_RESPONSE = 24 * 1024;
 constexpr int MAX_PAGE_SIZE = 16;
-// Below either figure a TLS handshake or a 16KB record can fail with MEMORY_E. The free-heap floor
-// matches OpdsBookBrowserActivity::fetchFeed; the block floor leaves headroom over one ~17KB record.
-constexpr uint32_t TLS_FREE_HEAP_FLOOR = 60000;
-constexpr uint32_t TLS_MAX_ALLOC_FLOOR = 32000;
 
 // Held across one plugin TLS request. When the heap is short it releases the rebuildable font
 // caches and keeps the 24KB glyph slab off, so the Loading repaint that runs during the request
@@ -77,9 +73,9 @@ constexpr uint32_t TLS_MAX_ALLOC_FLOOR = 32000;
 class TlsHeapScope {
  public:
   explicit TlsHeapScope(GfxRenderer& renderer) : renderer(renderer) {
+    if (!HttpDownloader::heapShortForTls()) return;
     const uint32_t freeHeap = ESP.getFreeHeap();
     const uint32_t maxAlloc = ESP.getMaxAllocHeap();
-    if (freeHeap >= TLS_FREE_HEAP_FLOOR && maxAlloc >= TLS_MAX_ALLOC_FLOOR) return;
     {
       RenderLock lock;  // a queued repaint may still be drawing with these caches
       if (auto* fcm = renderer.getFontCacheManager()) {
